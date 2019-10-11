@@ -8,7 +8,9 @@ import (
 	"time"
 
 	mustgatherv1alpha1 "github.com/masayag/must-gather-operator/pkg/apis/mustgather/v1alpha1"
+	routev1 "github.com/openshift/api/route/v1"
 	"github.com/openshift/library-go/pkg/operator/resource/retry"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -18,6 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	errorsutils "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -137,14 +140,218 @@ func (r *ReconcileMustGatherReport) Reconcile(request reconcile.Request) (reconc
 
 	if len(podList.Items) == 0 {
 		// Create and run pods for gathering diagnostic data
-		err = r.runMustGather(instance)
+		pvcName, err := r.runMustGather(instance)
 		if err != nil {
+			return reconcile.Result{}, err
+		}
+
+		// Expose the must gather data:
+		url, err := r.exposeMustGatherData(instance, pvcName)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+
+		// Update status.ReportURL if needed
+		instance.Status.ReportURL = url
+		err = r.client.Status().Update(context.TODO(), instance)
+		if err != nil {
+			reqLogger.Error(err, "Failed to update MustGather operator status")
 			return reconcile.Result{}, err
 		}
 	}
 
-	// TODO: update pod status with Report URL after compressing & exposing the resource
 	return reconcile.Result{}, nil
+}
+
+// exposeMustGatherData Exposes the nginx with oauth proxy containg compressed must-gather data and return the URL of the nginx:
+func (r *ReconcileMustGatherReport) exposeMustGatherData(cr *mustgatherv1alpha1.MustGatherReport, pvcName string) (string, error) {
+	// Create service serving the compressed/filtered must-gather data:
+	svc := r.newService(cr)
+	if err := r.client.Create(context.TODO(), svc); err != nil {
+		log.Error(err, "Failed to create service")
+	}
+
+	// Create route serving the compressed/filtered must-gather data:
+	route := r.newRoute(cr, svc)
+	if err := r.client.Create(context.TODO(), route); err != nil {
+		log.Error(err, "Failed to create route")
+	}
+
+	// Patch SA:
+	if err := r.patchServiceAccount(cr, route); err != nil {
+		log.Error(err, "Failed to path service account")
+	}
+
+	// Deploy the ngnix & oauth proxy serving the must gather data:
+	nginx := r.newNginx(cr, pvcName)
+	if err := r.client.Create(context.TODO(), nginx); err != nil {
+		log.Error(err, "Failed to create nginx hosting the must gather data")
+	}
+
+	// Wait for route ingress host:
+	for {
+		if err := r.client.Get(context.TODO(), types.NamespacedName{Name: route.Name, Namespace: route.Namespace}, route); err != nil {
+			log.Error(err, "Failed to fetch route")
+		}
+		//log.Info("Route:", route.Status)
+		if len(route.Status.Ingress) > 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	return route.Status.Ingress[0].Host, nil // FIXME which ingress index to access?
+}
+
+func (r *ReconcileMustGatherReport) patchServiceAccount(cr *mustgatherv1alpha1.MustGatherReport, route *routev1.Route) error {
+	sa := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "must-gather-operator",
+			Namespace: cr.Namespace,
+			Annotations: map[string]string{
+				"serviceaccounts.openshift.io/oauth-redirectreference.primary": "{\"kind\":\"OAuthRedirectReference\",\"apiVersion\":\"v1\",\"reference\":{\"kind\":\"Route\",\"name\":\"" + route.Name + "\"}}",
+			},
+		},
+	}
+	return r.client.Update(context.TODO(), sa)
+}
+
+func (r *ReconcileMustGatherReport) newNginx(cr *mustgatherv1alpha1.MustGatherReport, pvcName string) *appsv1.Deployment {
+	const nginx = "must-gather-operator-nginx"
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: nginx + "-",
+			Namespace:    cr.Namespace,
+			Labels:       labelsForMustGather(cr.Name),
+		},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"app": nginx,
+				},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"app": nginx,
+					},
+				},
+				Spec: corev1.PodSpec{
+					ServiceAccountName: "must-gather-operator",
+					Containers: []corev1.Container{
+						// Oauth-proxy
+						{
+							Name:            "oauth-proxy",
+							Image:           "openshift/oauth-proxy:latest",
+							ImagePullPolicy: "Always",
+							Ports: []corev1.ContainerPort{
+								{
+									ContainerPort: 8443,
+									Name:          "public",
+								},
+							},
+							Args: []string{
+								"--https-address=:8443",
+								"--provider=openshift",
+								"--openshift-service-account=must-gather-operator",
+								"--upstream=http://localhost:8080",
+								"--tls-cert=/etc/tls/private/tls.crt",
+								"--tls-key=/etc/tls/private/tls.key",
+								"--cookie-secret=SECRET",
+								"--request-logging=true", // REMOVE ME
+								// # Allows access if the user can view the service 'kubelet' in namespace 'kube-system' (administrators only)
+								"--openshift-sar={\"namespace\":\"kube-system\",\"resource\":\"services\",\"name\":\"kubelet\",\"verb\":\"get\"}",
+							},
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									MountPath: "/etc/tls/private",
+									Name:      "must-gather-operator-tls",
+								},
+							},
+						},
+						// Nginx
+						{
+							Name:  "nginx",
+							Image: "bitnami/nginx",
+							Ports: []corev1.ContainerPort{
+								{
+									ContainerPort: 8080,
+								},
+							},
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									MountPath: "/opt/bitnami/nginx/html",
+									Name:      pvcName,
+								},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "must-gather-operator-tls",
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{
+									SecretName: "must-gather-operator-tls",
+								},
+							},
+						},
+						{
+							Name: pvcName,
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: pvcName,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func (r *ReconcileMustGatherReport) newService(cr *mustgatherv1alpha1.MustGatherReport) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "must-gather-operator-",
+			Namespace:    cr.Namespace,
+			Labels:       labelsForMustGather(cr.Name),
+			Annotations: map[string]string{
+				"service.alpha.openshift.io/serving-cert-secret-name": "must-gather-operator-tls",
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "must-gather-operator",
+					Port:       443,
+					TargetPort: intstr.FromInt(8443),
+				},
+			},
+			Selector: map[string]string{
+				"app": "must-gather-operator-nginx",
+			},
+		},
+	}
+}
+
+func (r *ReconcileMustGatherReport) newRoute(cr *mustgatherv1alpha1.MustGatherReport, svc *corev1.Service) *routev1.Route {
+	return &routev1.Route{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "must-gather-operator-",
+			Namespace:    cr.Namespace,
+			Labels:       labelsForMustGather(cr.Name),
+		},
+		Spec: routev1.RouteSpec{
+			To: routev1.RouteTargetReference{
+				Kind: "Service",
+				Name: svc.Name,
+			},
+			TLS: &routev1.TLSConfig{
+				Termination: "reencrypt",
+			},
+		},
+	}
 }
 
 // IsValid checks the validity of the MustGatherReport cr
@@ -167,7 +374,7 @@ func (r *ReconcileMustGatherReport) IsCompleted(cr *mustgatherv1alpha1.MustGathe
 }
 
 // Run creates and runs a must-gather pod.d
-func (r *ReconcileMustGatherReport) runMustGather(cr *mustgatherv1alpha1.MustGatherReport) error {
+func (r *ReconcileMustGatherReport) runMustGather(cr *mustgatherv1alpha1.MustGatherReport) (string, error) {
 	var err error
 	log := log.WithValues("MustGatherReport.Namespace", cr.Namespace, "MustGatherReport.Name", cr.Name)
 
@@ -180,28 +387,28 @@ func (r *ReconcileMustGatherReport) runMustGather(cr *mustgatherv1alpha1.MustGat
 	defaultStorageClass := r.getDefaultStorageClass()
 	if defaultStorageClass == "" {
 		log.Error(err, "Failed to create pvc, no default storage class defined")
-		return err
+		return "", err
 	}
 
 	for _, image := range cr.Spec.Images {
-		pvc = r.newPVC(cr, cr.Namespace, &defaultStorageClass)
+		pvc = r.newPVC(cr, cr.Namespace, &defaultStorageClass) // FIXME: works only for single PVC
 		if err := r.client.Create(context.TODO(), pvc); err != nil {
 			log.Error(err, "Failed to create pvc")
 		}
 		if err := controllerutil.SetControllerReference(cr, pvc, r.scheme); err != nil {
-			return err
+			return "", err
 		}
 
 		pod = r.newPod(image, cr, cr.Namespace, pvc)
 		err := r.client.Create(context.TODO(), pod)
 		if err != nil {
-			return err
+			return "", err
 		}
 
 		// Set MustGatherReport instance as the owner and controller
 		err = controllerutil.SetControllerReference(cr, pod, r.scheme)
 		if err != nil {
-			return err
+			return "", err
 		}
 
 		log.Info("pod for plug-in Image created", "Image", image)
@@ -239,7 +446,7 @@ func (r *ReconcileMustGatherReport) runMustGather(cr *mustgatherv1alpha1.MustGat
 	}
 	errors := errorsutils.NewAggregate(arr)
 	log.Info("Gather for all images finished: Message", "Message", errors)
-	return errors
+	return pvc.Name, errors
 }
 
 func (r *ReconcileMustGatherReport) waitForPodRunning(pod *corev1.Pod) error {
@@ -308,7 +515,7 @@ func (r *ReconcileMustGatherReport) getDefaultStorageClass() string {
 func (r *ReconcileMustGatherReport) newPVC(cr *mustgatherv1alpha1.MustGatherReport, nsName string, storageClass *string) *corev1.PersistentVolumeClaim {
 	return &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: "must-gather-",
+			GenerateName: "must-gather-pvc-",
 			Namespace:    nsName,
 			Labels:       labelsForMustGather(cr.Name),
 		},
