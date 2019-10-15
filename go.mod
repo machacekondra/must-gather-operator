@@ -2,6 +2,7 @@ module github.com/masayag/must-gather-operator
 
 require (
 	github.com/NYTimes/gziphandler v1.0.1 // indirect
+	github.com/go-logr/logr v0.1.0
 	github.com/go-openapi/spec v0.19.0
 	github.com/openshift/api v3.9.0+incompatible
 	github.com/openshift/library-go v0.0.0-20191011123304-1c39da790554
